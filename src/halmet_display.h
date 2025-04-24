@@ -8,7 +8,7 @@
 
 namespace halmet {
 
-bool InitializeSSD1306(sensesp::SensESPBaseApp* sensesp_app,
+bool InitializeSSD1306(const std::shared_ptr<sensesp::SensESPBaseApp> sensesp_app,
                        Adafruit_SSD1306** display, TwoWire* i2c);
 
 void ClearRow(Adafruit_SSD1306* display, int row);
