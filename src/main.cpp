@@ -48,11 +48,11 @@ using namespace halmet;
 
 #ifndef ENABLE_SIGNALK
 #define BUILDER_CLASS SensESPMinimalAppBuilder
-SensESPMinimalApp* sensesp_app;
-Networking* networking;
-MDNSDiscovery* mdns_discovery;
-HTTPServer* http_server;
-SystemStatusLed* system_status_led;
+std::shared_ptr<SensESPMinimalApp> sensesp_app;
+std::shared_ptr<Networking> networking;
+std::shared_ptr<MDNSDiscovery> mdns_discovery;
+std::shared_ptr<HTTPServer> http_server;
+std::shared_ptr<SystemStatusLed> system_status_led;
 #endif
 
 /////////////////////////////////////////////////////////////////////
@@ -136,9 +136,7 @@ void setup() {
 #ifdef ENABLE_TEST_OUTPUT_PIN
   pinMode(kTestOutputPin, OUTPUT);
   // Set the LEDC peripheral to a 13-bit resolution
-  ledcSetup(0, kTestOutputFrequency, 13);
-  // Attach the channel to the GPIO pin to be controlled
-  ledcAttachPin(kTestOutputPin, 0);
+  ledcAttach(kTestOutputPin, kTestOutputFrequency, 13);
   // Set the duty cycle to 50%
   // Duty cycle value is calculated based on the resolution
   // For 13-bit resolution, max value is 8191, so 50% is 4096
@@ -192,15 +190,15 @@ void setup() {
 
 #ifndef ENABLE_SIGNALK
   // Initialize components that would normally be present in SensESPApp
-  networking = new Networking("/System/WiFi Settings", "", "");
+  networking = std::make_shared<Networking>("/System/WiFi Settings", "", "");
   ConfigItem(networking);
-  mdns_discovery = new MDNSDiscovery();
-  http_server = new HTTPServer();
-  system_status_led = new SystemStatusLed(LED_BUILTIN);
+  mdns_discovery = std::make_shared<MDNSDiscovery>();
+  http_server = std::make_shared<HTTPServer>();
+  system_status_led = std::make_shared<SystemStatusLed>(LED_BUILTIN);
 #endif
 
   // Initialize the OLED display
-  bool display_present = InitializeSSD1306(sensesp_app.get(), &display, i2c);
+  bool display_present = InitializeSSD1306(sensesp_app->get(), &display, i2c);
 
   ///////////////////////////////////////////////////////////////////
   // Analog inputs
