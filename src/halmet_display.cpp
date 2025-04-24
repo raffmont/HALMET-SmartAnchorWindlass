@@ -9,7 +9,7 @@ namespace halmet {
 const int kScreenWidth = 128;
 const int kScreenHeight = 64;
 
-bool InitializeSSD1306(sensesp::SensESPBaseApp* sensesp_app,
+bool InitializeSSD1306(const std::shared_ptr<sensesp::SensESPBaseApp> sensesp_app,
                        Adafruit_SSD1306** display, TwoWire* i2c) {
   *display = new Adafruit_SSD1306(kScreenWidth, kScreenHeight, i2c, -1);
   bool init_successful = (*display)->begin(SSD1306_SWITCHCAPVCC, 0x3C);
