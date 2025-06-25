@@ -12,10 +12,6 @@
 #include <Adafruit_GFX.h>
 #include <Adafruit_SSD1306.h>
 
-#ifdef ENABLE_NMEA2000_OUTPUT
-#include <NMEA2000_esp32.h>
-#endif
-
 #include "n2k_senders.h"
 #include "sensesp/net/discovery.h"
 #include "sensesp/sensors/analog_input.h"
@@ -28,12 +24,14 @@
 #include "sensesp/transforms/linear.h"
 #include "sensesp/ui/config_item.h"
 
-#ifdef ENABLE_SIGNALK
+#include "sensesp/sensors/digital_output.h"
+#include "sensesp/signalk/signalk_listener.h"
+#include "sensesp/signalk/signalk_value_listener.h"
+#include "sensesp/transforms/debounce.h"
+#include "sensesp/transforms/moving_average.h"
+
 #include "sensesp_app_builder.h"
 #define BUILDER_CLASS SensESPAppBuilder
-#else
-#include "sensesp_minimal_app_builder.h"
-#endif
 
 #include "halmet_analog.h"
 #include "halmet_const.h"
@@ -46,29 +44,42 @@
 using namespace sensesp;
 using namespace halmet;
 
-#ifndef ENABLE_SIGNALK
-#define BUILDER_CLASS SensESPMinimalAppBuilder
-std::shared_ptr<SensESPMinimalApp> sensesp_app;
-std::shared_ptr<Networking> networking;
-std::shared_ptr<MDNSDiscovery> mdns_discovery;
-std::shared_ptr<HTTPServer> http_server;
-std::shared_ptr<SystemStatusLed> system_status_led;
-#endif
-
 /////////////////////////////////////////////////////////////////////
 // Declare some global variables required for the firmware operation.
 
-#ifdef ENABLE_NMEA2000_OUTPUT
-tNMEA2000* nmea2000;
-elapsedMillis n2k_time_since_rx = 0;
-elapsedMillis n2k_time_since_tx = 0;
-#endif
+#define WINDLASS_GO_DOWN +1
+#define WINDLASS_GO_UP -1
 
 TwoWire* i2c;
 Adafruit_SSD1306* display;
 
-// Store alarm states in an array for local display output
-bool alarm_states[4] = {false, false, false, false};
+// Actuate the relay for going up
+const uint8_t goUpPin = 17;
+
+// Actuate the relay for going down
+const uint8_t goDownPin = 16;
+
+// Counter for chain events
+int chainCounter = 0;  
+
+// 1 =  Chain down / count up, -1 = Chain up / count backwards
+int upDown = WINDLASS_GO_DOWN;  
+
+// Stores last ChainCounter value to allow storage to nonvolatile storage in case of value changes
+int lastSavedCounter = 0;
+
+#define ENABLE_DEMO 1                // Set to 1 to enable Demo Mode with up/down counter
+#define SAFETY_STOP 0                // Defines safety stop for chain up. Stops defined number of events before reaching zero
+#define MAX_CHAIN_LENGTH 40          // Define maximum chan length. Relay off after the value is reached
+
+
+// Translates counter impuls to meter 0,33 m per pulse
+float chainCalibrationValue = 0.33f; 
+float chainCalibrationOffset = 0.00f;
+
+unsigned long lastChainSpeedMills = millis();
+
+
 
 // Set the ADS1115 GAIN to adjust the analog input voltage range.
 // On HALMET, this refers to the voltage range of the ADS1115 input
@@ -83,18 +94,6 @@ bool alarm_states[4] = {false, false, false, false};
 
 const adsGain_t kADS1115Gain = GAIN_ONE;
 
-/////////////////////////////////////////////////////////////////////
-// Test output pin configuration. If ENABLE_TEST_OUTPUT_PIN is defined,
-// GPIO 33 will output a pulse wave at 380 Hz with a 50% duty cycle.
-// If this output and GND are connected to one of the digital inputs, it can
-// be used to test that the frequency counter functionality is working.
-#define ENABLE_TEST_OUTPUT_PIN
-#ifdef ENABLE_TEST_OUTPUT_PIN
-const int kTestOutputPin = GPIO_NUM_33;
-// With the default pulse rate of 100 pulses per revolution (configured in
-// halmet_digital.cpp), this frequency corresponds to 3.8 r/s or about 228 rpm.
-const int kTestOutputFrequency = 380;
-#endif
 
 /////////////////////////////////////////////////////////////////////
 // The setup function performs one-time application initialization.
@@ -113,7 +112,7 @@ void setup() {
   BUILDER_CLASS builder;
   sensesp_app = (&builder)
                     // EDIT: Set a custom hostname for the app.
-                    ->set_hostname("halmet")
+                    ->set_hostname("halmet-windlass-controller")
                     // EDIT: Optionally, hard-code the WiFi and Signal K server
                     // settings. This is normally not needed.
                     //->set_wifi("My WiFi SSID", "my_wifi_password")
@@ -133,230 +132,237 @@ void setup() {
   bool ads_initialized = ads1115->begin(kADS1115Address, i2c);
   debugD("ADS1115 initialized: %d", ads_initialized);
 
-#ifdef ENABLE_TEST_OUTPUT_PIN
-  pinMode(kTestOutputPin, OUTPUT);
-  // Set the LEDC peripheral to a 13-bit resolution
-  ledcAttach(kTestOutputPin, kTestOutputFrequency, 13);
-  // Set the duty cycle to 50%
-  // Duty cycle value is calculated based on the resolution
-  // For 13-bit resolution, max value is 8191, so 50% is 4096
-  ledcWrite(0, 4096);
-#endif
-
-#ifdef ENABLE_NMEA2000_OUTPUT
-  /////////////////////////////////////////////////////////////////////
-  // Initialize NMEA 2000 functionality
-
-  nmea2000 = new tNMEA2000_esp32(kCANTxPin, kCANRxPin);
-
-  // Reserve enough buffer for sending all messages.
-  nmea2000->SetN2kCANSendFrameBufSize(250);
-  nmea2000->SetN2kCANReceiveFrameBufSize(250);
-
-  // Set Product information
-  // EDIT: Change the values below to match your device.
-  nmea2000->SetProductInformation(
-      "20231229",  // Manufacturer's Model serial code (max 32 chars)
-      104,         // Manufacturer's product code
-      "HALMET",    // Manufacturer's Model ID (max 33 chars)
-      "1.0.0",     // Manufacturer's Software version code (max 40 chars)
-      "1.0.0"      // Manufacturer's Model version (max 24 chars)
-  );
-
-  // For device class/function information, see:
-  // http://www.nmea.org/Assets/20120726%20nmea%202000%20class%20&%20function%20codes%20v%202.00.pdf
-
-  // For mfg registration list, see:
-  // https://actisense.com/nmea-certified-product-providers/
-  // The format is inconvenient, but the manufacturer code below should be
-  // one not already on the list.
-
-  // EDIT: Change the class and function values below to match your device.
-  nmea2000->SetDeviceInformation(
-      GetBoardSerialNumber(),  // Unique number. Use e.g. Serial number.
-      140,                     // Device function: Engine
-      50,                      // Device class: Propulsion
-      2046);                   // Manufacturer code
-
-  nmea2000->SetMode(tNMEA2000::N2km_NodeOnly,
-                    71  // Default N2k node address
-  );
-  nmea2000->EnableForward(false);
-  nmea2000->Open();
-
-  // No need to parse the messages at every single loop iteration; 1 ms will do
-  event_loop()->onRepeat(1, []() { nmea2000->ParseMessages(); });
-#endif  // ENABLE_NMEA2000_OUTPUT
-
-#ifndef ENABLE_SIGNALK
-  // Initialize components that would normally be present in SensESPApp
-  networking = std::make_shared<Networking>("/System/WiFi Settings", "", "");
-  ConfigItem(networking);
-  mdns_discovery = std::make_shared<MDNSDiscovery>();
-  http_server = std::make_shared<HTTPServer>();
-  system_status_led = std::make_shared<SystemStatusLed>(LED_BUILTIN);
-#endif
-
   // Initialize the OLED display
   bool display_present = InitializeSSD1306(sensesp_app->get(), &display, i2c);
 
-  ///////////////////////////////////////////////////////////////////
-  // Analog inputs
 
-#ifdef ENABLE_SIGNALK
-  bool enable_signalk_output = true;
-#else
-  bool enable_signalk_output = false;
-#endif
+    // Configuraion paths
+  String goingUpDownSensorReadDelayConfigPath = "/sensor_going_up_down/read_delay";
+  String windlassStatusSKPathConfigPath = "/windlass_status/sk";
+  String goingUpDownSensorDebounceDelayConfigPath = "/sensor_going_up_down/debounce_delay";
+  String chainCounterSKPathConfigPath = "/rodeDeployed/sk";
+  String chainCounterSensorDebounceDelayConfigPath = "/chain_counter_sensor/debounce_delay";
+  String chainSpeedSKPathConfigPath = "/chainSpeed/sk";
+  String chainCalibrationSKPathConfigPath = "/chain_counter_sensor/calibration_value";
 
-  // Connect the tank senders.
-  // EDIT: To enable more tanks, uncomment the lines below.
-  auto tank_a1_volume = ConnectTankSender(ads1115, 0, "Fuel", "fuel.main", 3000,
-                                          enable_signalk_output);
-  // auto tank_a2_volume = ConnectTankSender(ads1115, 1, "A2");
-  // auto tank_a3_volume = ConnectTankSender(ads1115, 2, "A3");
-  // auto tank_a4_volume = ConnectTankSender(ads1115, 3, "A4");
+  // Signal K paths
+  String windlassStatusSKPath = "navigation.anchor.windlass.status";
+  String chainCounterSKPath = "navigation.anchor.rodeDeployed";
+  String chainSpeedSKPath = "navigation.anchor.windlass.speed";
 
-#ifdef ENABLE_NMEA2000_OUTPUT
-  // Tank 1, instance 0. Capacity 200 liters. You can change the capacity
-  // in the web UI as well.
-  // EDIT: Make sure this matches your tank configuration above.
-  N2kFluidLevelSender* tank_a1_sender = new N2kFluidLevelSender(
-      "/Tanks/Fuel/NMEA 2000", 0, N2kft_Fuel, 200, nmea2000);
+  // Chain counter metadata
+  SKMetadata* chainCounterMetadata = new SKMetadata();
+  chainCounterMetadata->units_ = "m";
+  chainCounterMetadata->description_ = "Anchor Chain Deployed";
+  chainCounterMetadata->display_name_ = "Chain Deployed";
+  chainCounterMetadata->short_name_ = "Chain Out";
 
-  ConfigItem(tank_a1_sender)
-      ->set_title("Tank A1 NMEA 2000")
-      ->set_description("NMEA 2000 tank sender for tank A1")
-      ->set_sort_order(3005);
+  // Chain counter speed metadata
+  SKMetadata* chainSpeedMetadata = new SKMetadata();
+  chainSpeedMetadata->units_ = "m/s";
+  chainSpeedMetadata->description_ = "Windlass chain speed";
+  chainSpeedMetadata->display_name_ = "Windlass speed";
+  chainSpeedMetadata->short_name_ = "Chain speed";
 
-  tank_a1_volume->connect_to(&(tank_a1_sender->tank_level_));
-#endif  // ENABLE_NMEA2000_OUTPUT
+  auto* windlassStatusSKOutput = new SKOutputString(windlassStatusSKPath, windlassStatusSKPathConfigPath);
+  windlassStatusSKOutput->emit("off");
 
-  if (display_present) {
-    // EDIT: Duplicate the lines below to make the display show all your tanks.
-    tank_a1_volume->connect_to(new LambdaConsumer<float>(
-        [](float value) { PrintValue(display, 2, "Tank A1", 100 * value); }));
-  }
 
-  // Read the voltage level of analog input A2
-  auto a2_voltage = new ADS1115VoltageInput(ads1115, 1, "/Voltage A2");
-
-  ConfigItem(a2_voltage)
-      ->set_title("Analog Voltage A2")
-      ->set_description("Voltage level of analog input A2")
-      ->set_sort_order(3000);
-
-  a2_voltage->connect_to(new LambdaConsumer<float>(
-      [](float value) { debugD("Voltage A2: %f", value); }));
-
-  // If you want to output something else than the voltage value,
-  // you can insert a suitable transform here.
-  // For example, to convert the voltage to a distance with a conversion
-  // factor of 0.17 m/V, you could use the following code:
-  // auto a2_distance = new Linear(0.17, 0.0);
-  // a2_voltage->connect_to(a2_distance);
-
-#ifdef ENABLE_SIGNALK
-  a2_voltage->connect_to(
-      new SKOutputFloat("sensors.a2.voltage", "Analog Voltage A2",
-                        new SKMetadata("V","Analog Voltage A2")));
-  // Example of how to output the distance value to Signal K.
-  // a2_distance->connect_to(
-  //     new SKOutputFloat("sensors.a2.distance", "Analog Distance A2",
-  //                       new SKMetadata("m", "Analog Distance A2")));
-#endif
 
   ///////////////////////////////////////////////////////////////////
-  // Digital alarm inputs
+  // Digitakl outputs
 
-  // EDIT: More alarm inputs can be defined by duplicating the lines below.
-  // Make sure to not define a pin for both a tacho and an alarm.
-  auto alarm_d2_input = ConnectAlarmSender(kDigitalInputPin2, "D2");
-  auto alarm_d3_input = ConnectAlarmSender(kDigitalInputPin3, "D3");
-  // auto alarm_d4_input = ConnectAlarmSender(kDigitalInputPin4, "D4");
+  // Set the relay pins as output
+  pinMode(goUpPin, OUTPUT);
+  pinMode(goDownPin, OUTPUT);
 
-  // Update the alarm states based on the input value changes.
-  // EDIT: If you added more alarm inputs, uncomment the respective lines below.
-  alarm_d2_input->connect_to(
-      new LambdaConsumer<bool>([](bool value) { alarm_states[1] = value; }));
-  // In this example, alarm_d3_input is active low, so invert the value.
-  auto alarm_d3_inverted = alarm_d3_input->connect_to(
-      new LambdaTransform<bool, bool>([](bool value) { return !value; }));
-  alarm_d3_inverted->connect_to(
-      new LambdaConsumer<bool>([](bool value) { alarm_states[2] = value; }));
-  // alarm_d4_input->connect_to(
-  //     new LambdaConsumer<bool>([](bool value) { alarm_states[3] = value; }));
-
-#ifdef ENABLE_NMEA2000_OUTPUT
-  // EDIT: This example connects the D2 alarm input to the low oil pressure
-  // warning. Modify according to your needs.
-  N2kEngineParameterDynamicSender* engine_dynamic_sender =
-      new N2kEngineParameterDynamicSender("/NMEA 2000/Engine 1 Dynamic", 0,
-                                          nmea2000);
-
-  ConfigItem(engine_dynamic_sender)
-      ->set_title("Engine 1 Dynamic")
-      ->set_description("NMEA 2000 dynamic engine parameters for engine 1")
-      ->set_sort_order(3010);
-
-  alarm_d2_input->connect_to(engine_dynamic_sender->low_oil_pressure_);
-
-  // This is just an example -- normally temperature alarms would not be
-  // active-low (inverted).
-  alarm_d3_inverted->connect_to(engine_dynamic_sender->over_temperature_);
-#endif  // ENABLE_NMEA2000_OUTPUT
-
-  // FIXME: Transmit the alarms over SK as well.
-
+  // Set the relay pins as low
+  digitalWrite(goUpPin, LOW );
+  digitalWrite(goDownPin, LOW );
+  
   ///////////////////////////////////////////////////////////////////
-  // Digital tacho inputs
+  // Digital inputs
 
-  // Connect the tacho senders. Engine name is "main".
-  // EDIT: More tacho inputs can be defined by duplicating the line below.
-  auto tacho_d1_frequency = ConnectTachoSender(kDigitalInputPin1, "main");
+  auto chainCounterSensor = ConnectAlarmSender(kDigitalInputPin1, "D1");
+  auto goingUpSensor = ConnectAlarmSender(kDigitalInputPin2, "D2");
+  auto goingDownSensor = ConnectAlarmSender(kDigitalInputPin3, "D3");
+  
+  chainCounterSensor->connect_to(
 
-#ifdef ENABLE_NMEA2000_OUTPUT
-  // Connect outputs to the N2k senders.
-  // EDIT: Make sure this matches your tacho configuration above.
-  //       Duplicate the lines below to connect more tachos, but be sure to
-  //       use different engine instances.
-  N2kEngineParameterRapidSender* engine_rapid_sender =
-      new N2kEngineParameterRapidSender("/NMEA 2000/Engine 1 Rapid Update", 0,
-                                        nmea2000);  // Engine 1, instance 0
+      // Create a lambda transform function
+      new LambdaTransform<int,int>(
 
-  ConfigItem(engine_rapid_sender)
-      ->set_title("Engine 1 Rapid Update")
-      ->set_description("NMEA 2000 rapid update engine parameters for engine 1")
-      ->set_sort_order(3015);
+        // Catch the counter and the status output instances, input is HIGH when the pin status changes
+        [windlassStatusSKOutput](int input) {
+        
+          // Check if it is the rising front of the pin status change
+          if (input == HIGH) {
 
-  tacho_d1_frequency->connect_to(&(engine_rapid_sender->engine_speed_));
+            // Increase or decrease the couter
+            chainCounter = chainCounter + upDown;
+            
+            // Safety stop counter reached while chain is going up
+            if (
+              // If the windlass is going up...
+              digitalRead(kDigitalInputPin2) == HIGH
+              
+              // ...and the chain counter reached the safety limit, stop the windlass
+              && (chainCounter <= SAFETY_STOP) 
+            ) {  
+              // Shutdown the relay on up
+              digitalWrite(goUpPin, LOW );
 
-#endif  // ENABLE_NMEA2000_OUTPUT
+              // Update windlass status
+              windlassStatusSKOutput->emit("off");
 
-  if (display_present) {
-    tacho_d1_frequency->connect_to(new LambdaConsumer<float>(
-        [](float value) { PrintValue(display, 3, "RPM D1", 60 * value); }));
-  }
+            }
+            // Maximum chain lenght reached   
+            else if (
+              // If the windlass is going up...
+              digitalRead(kDigitalInputPin3) == HIGH
+
+              // ...and the rod is deployed, stop the windlass
+              && (chainCounter >= MAX_CHAIN_LENGTH) 
+            ) {  
+              // Shutdown the relay on up
+              digitalWrite(goUpPin, LOW );
+
+              // Update windlass status
+              windlassStatusSKOutput->emit("off");
+            }
+            // Check if the chain if free falling
+            else if (
+              // If the windlass is going down...
+              upDown == WINDLASS_GO_DOWN
+
+              // ...but the going down sensor is not sensing it, the windlass is in free fall status
+              && digitalRead(kDigitalInputPin3)==LOW) {
+
+              // Update windlass status
+              windlassStatusSKOutput->emit("freeFall");  
+            }
+            // Check if the chain is free rising (for example manually)
+            else if (
+              // If the windlass is going up...
+              upDown == WINDLASS_GO_UP
+              
+              // ...but the going up sensor is not sensing it, the windlass is in free up status
+              && digitalRead(kDigitalInputPin2)==LOW) {
+              
+              // Update windlass status
+              windlassStatusSKOutput->emit("freeUp");  
+            }
+          }
+
+          // Returm thr chain counter value
+          return chainCounter;
+        }
+        )
+      )
+    ->connect_to(new Linear(chainCalibrationValue, chainCalibrationOffset, chainCalibrationSKPathConfigPath))
+    ->connect_to(new SKOutputFloat(chainCounterSKPath, chainCounterSKPathConfigPath, chainCounterMetadata));
+    
+  
+
+  goingUpSensor->connect_to(new LambdaConsumer<int>([windlassStatusSKOutput](int input) {
+
+      // Check if the windlass is going up (press)
+      if (input == HIGH) {
+
+        // The windlass is going up, update the upDown variable
+        upDown = WINDLASS_GO_UP;
+
+        // Update the windlass status
+        windlassStatusSKOutput->emit("up");
+      } else {
+
+        // The windlass is not going up anymore (release), update the windlass status
+        windlassStatusSKOutput->emit("off");
+      }
+    }));
+  
+  goingDownSensor->connect_to(new LambdaConsumer<int>([windlassStatusSKOutput](int input) {
+
+      // Check if the windlass is going down (press)
+      if (input == HIGH) {
+
+        // The windlass is going down, update the upDown variable
+        upDown = WINDLASS_GO_DOWN;
+
+        // Update the windlass status
+        windlassStatusSKOutput->emit("down");
+      } else {
+        // The windlass is not going down anymore (release), update the windlass status
+        windlassStatusSKOutput->emit("off");
+      }
+    }));
+
+
+  // Sense the chain speed
+  auto chainSpeedSensor = ConnectTachoSender(kDigitalInputPin1, "windlass");
+
+
+  // Manage the chain speed sensor
+  chainSpeedSensor
+      ->connect_to(new Linear(chainCalibrationValue, chainCalibrationOffset, chainCalibrationSKPathConfigPath))
+      ->connect_to(new MovingAverage(4, 4))                                          
+      ->connect_to(new SKOutputFloat(chainSpeedSKPath, chainSpeedSKPathConfigPath, chainSpeedMetadata));  
+
+
+  // Create a linstener for the SignalK windlass status path
+  auto windlassStatusListener = new StringSKListener(windlassStatusSKPath);
+
+  // Connect the listener
+  windlassStatusListener->connect_to(
+
+      // Create a lambda consumer function
+      new LambdaConsumer<String>(
+        [](String input) {
+
+          // Check if a chain counter reset is needed
+          if (input == "reset") {
+
+            // Reset the counter
+            chainCounter = 0;
+          }  
+          // Check if the status is up and the windlass is not going up
+          else if (input == "up" && digitalRead(kDigitalInputPin2) == LOW) {
+
+            // Activate the relay up
+            digitalWrite(goUpPin,HIGH); 
+          }
+          // Check if the status is down and the windlass is not going down
+          else if (input == "down" && digitalRead(kDigitalInputPin3) == LOW) {
+
+            // Activate the relay down
+            digitalWrite(goDownPin,HIGH); 
+          }
+          // Check if the status is off and the ralay is up or down
+          else if (input == "off" && (digitalRead(kDigitalInputPin2) == HIGH || digitalRead(kDigitalInputPin3) == HIGH)) {
+
+            // Switch off the relay on up
+            digitalWrite(goUpPin,LOW); 
+
+            // Switch off the relay on down
+            digitalWrite(goDownPin,LOW); 
+          }
+        }));
+
+
+  
+
 
   ///////////////////////////////////////////////////////////////////
   // Display setup
 
   // Connect the outputs to the display
+  
   if (display_present) {
-#ifdef ENABLE_SIGNALK
+    /*
     event_loop()->onRepeat(1000, []() {
       PrintValue(display, 1, "IP:", WiFi.localIP().toString());
     });
-#endif
-
-    // Create a poor man's "christmas tree" display for the alarms
-    event_loop()->onRepeat(1000, []() {
-      char state_string[5] = {};
-      for (int i = 0; i < 4; i++) {
-        state_string[i] = alarm_states[i] ? '*' : '_';
-      }
-      PrintValue(display, 4, "Alarm", state_string);
-    });
+    */
   }
 
   // To avoid garbage collecting all shared pointers created in setup(),
