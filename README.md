@@ -1,10 +1,21 @@
-# HALMET Example Firmware
+# HALMET Windlass Controller
 
-This repository provides example firmware for [HALMET: Hat Labs Marine Engine & Tank interface](https://shop.hatlabs.fi/products/halmet).
+The HALMET Windlass Controller interfaces the anchor windlass and its control box to a Signal K server.
+It requires electrical access to READ the Up & Down control signals from the windlass, AND the chain counter sensor (reed or hall effect) 
+It utilizes HALMET microcontroller [HatLab](https://shop.hatlabs.fi/products/halmet].
 
-To get started with the example firmware, follow the generic SensESP [Getting Started](https://signalk.org/SensESP/pages/getting_started/) instructions but use this repository instead of the SensESP Project Template.
+The device connects to an onboard Signal K server (https://signalk.org), providing the following features:
 
-By default, the example firmware is configured to read the engine RPM from input D1 and the fuel level from input A1. D2 is configured as a low oil pressure alarm input.
+* Count deployed anchor rode in meters.
+* Measure the up/down chain speed.
+* Sense the windlass status as going up, down, free down, free up, and off.
+* Enables remote/automatic windlass control reading the status.
+* Fully customizable Signal K keys and calibration parameters. 
+* Local chain counter reset button
+* Remote reset of chain counter
 
-To customize the software for your own purposes, edit the `src/main.cpp` file.
-Parts intended to be customized are marked with `EDIT:` comments.
+
+The device and all the software are provided with no warrinty or responsibility for correct or incorrect usage, eventually generating damages to people or freights.
+
+This work has been inspired and forked from https://github.com/raffmont/SensESP-Windlass-Controller; 
+which was partially  inspired by this repository https://github.com/AK-Homberger/ESP8266_AnchorChainControl_WLAN,  the SensESP example "Chain Counter".
