@@ -2,7 +2,7 @@
 
 The HALMET Windlass Controller interfaces the anchor windlass and its control box to a Signal K server.
 It requires electrical access to READ the Up & Down control signals from the windlass, AND the chain counter sensor (reed or hall effect) 
-It utilizes HALMET microcontroller [HatLab](https://shop.hatlabs.fi/products/halmet].
+It utilizes HALMET microcontroller (HatLab)[https://shop.hatlabs.fi/products/halmet].
 
 The device connects to an onboard Signal K server (https://signalk.org), providing the following features:
 
